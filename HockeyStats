@@ -1,0 +1,228 @@
+from flask import Flask, render_template, request, jsonify
+import pandas as pd
+import torch
+import torch.nn as nn
+import numpy as np
+import random
+
+app = Flask(__name__)
+
+# Load data
+data = pd.read_csv(r"C:\Users\joebo\OneDrive\Documents\Hockey Stuff\combined_dataset10_19.csv")
+data.fillna(0, inplace=True)
+
+team_data = pd.read_csv(r"C:\Users\joebo\OneDrive\Documents\Hockey Stuff\TeamStatsCombined.csv")
+team_data.fillna(0, inplace=True)
+
+# Prepare data
+player_names = data['Player'].values
+positions = data['Pos'].values
+player_features = data.drop(['Player', 'Pos'], axis=1).apply(pd.to_numeric, errors='coerce').fillna(0).values
+player_features_tensor = torch.tensor(player_features, dtype=torch.float32)
+team_features = team_data.drop(['Team Played'], axis=1).apply(pd.to_numeric, errors='coerce').fillna(0).values
+team_features_tensor = torch.tensor(team_features, dtype=torch.float32)
+
+# Model definitions
+class PlayerRankingModel(nn.Module):
+    def __init__(self, input_size, plus_minus_index, hits_index, to_index, weight_factor=2.0, to_penalty=2.0):
+        super(PlayerRankingModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+        self.plus_minus_index = plus_minus_index
+        self.hits_index = hits_index
+        self.to_index = to_index
+        self.weight_factor = weight_factor
+        self.to_penalty = to_penalty
+
+    def forward(self, x):
+        x[:, self.plus_minus_index] *= self.weight_factor
+        x[:, self.hits_index] *= self.weight_factor
+        x[:, self.to_index] *= -self.to_penalty
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+class GameScorePredictionModel(nn.Module):
+    def __init__(self, input_size):
+        super(GameScorePredictionModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, 32)
+        self.fc2 = nn.Linear(32, 16)
+        self.fc3 = nn.Linear(16, 2)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+# Initialize models
+plus_minus_index = data.columns.get_loc("Plus/Minus")
+hits_index = data.columns.get_loc("Hits")
+to_index = data.columns.get_loc("TO")
+
+player_model = PlayerRankingModel(input_size=player_features.shape[1], 
+                                plus_minus_index=plus_minus_index, 
+                                hits_index=hits_index, 
+                                to_index=to_index)
+score_model = GameScorePredictionModel(input_size=team_features.shape[1])
+
+@app.route('/')
+def home():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Hockey Analytics Dashboard</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 1200px;
+                margin: 0 auto;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                margin-bottom: 20px;
+            }
+            .button {
+                background-color: #4CAF50;
+                color: white;
+                padding: 10px 20px;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                margin: 5px;
+            }
+            .button:hover {
+                background-color: #45a049;
+            }
+            #results {
+                margin-top: 20px;
+                padding: 15px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+            }
+            .search-container {
+                margin: 20px 0;
+            }
+            input[type="text"] {
+                padding: 8px;
+                width: 200px;
+                margin-right: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Hockey Analytics Dashboard</h1>
+            
+            <div class="search-container">
+                <h2>Player Statistics</h2>
+                <input type="text" id="playerName" placeholder="Enter player name">
+                <button class="button" onclick="getPlayerStats()">Get Statistics</button>
+            </div>
+
+            <div class="search-container">
+                <h2>Team Analysis</h2>
+                <button class="button" onclick="getLineups()">Get Optimal Lineups</button>
+                <button class="button" onclick="predictGame()">Predict Next Game</button>
+            </div>
+
+            <div id="results"></div>
+        </div>
+
+        <script>
+        async function getPlayerStats() {
+            const playerName = document.getElementById('playerName').value;
+            const response = await fetch('/player_stats', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({player_name: playerName}),
+            });
+            const data = await response.json();
+            document.getElementById('results').innerHTML = data.result;
+        }
+
+        async function getLineups() {
+            const response = await fetch('/lineups');
+            const data = await response.json();
+            document.getElementById('results').innerHTML = data.result;
+        }
+
+        async function predictGame() {
+            const response = await fetch('/predict_game');
+            const data = await response.json();
+            document.getElementById('results').innerHTML = data.result;
+        }
+        </script>
+    </body>
+    </html>
+    """
+
+@app.route('/player_stats', methods=['POST'])
+def player_stats():
+    player_name = request.json['player_name']
+    player_row = data[data['Player'].str.lower() == player_name.lower()]
+    if player_row.empty:
+        result = f"No statistics found for {player_name}."
+    else:
+        result = player_row.to_html(index=False)
+    return jsonify({'result': result})
+
+@app.route('/lineups')
+def get_lineups():
+    player_model.eval()
+    with torch.no_grad():
+        scores = player_model(player_features_tensor).squeeze()
+    scores_numpy = scores.numpy()
+    sorted_indices = scores_numpy.argsort()[::-1]
+    sorted_players = player_names[sorted_indices]
+    sorted_positions = positions[sorted_indices]
+
+    forwards = sorted_players[sorted_positions == 'Forward']
+    defense = sorted_players[sorted_positions == 'Defense']
+
+    def group_players(players, group_size):
+        return [players[i:i+group_size] for i in range(0, len(players), group_size)]
+
+    forward_groups = group_players(forwards, 3)
+    defense_groups = group_players(defense, 2)
+
+    result = "<h3>Forward Lineouts:</h3>"
+    for idx, group in enumerate(forward_groups):
+        result += f"<p>Lineout {idx+1}: {', '.join(group)}</p>"
+
+    result += "<h3>Defense Lineouts:</h3>"
+    for idx, group in enumerate(defense_groups):
+        result += f"<p>Lineout {idx+1}: {', '.join(group)}</p>"
+
+    return jsonify({'result': result})
+
+@app.route('/predict_game')
+def predict_game():
+    score_model.eval()
+    with torch.no_grad():
+        scores = score_model(team_features_tensor).squeeze()
+    scores = scores.numpy()
+
+    if len(scores) >= 2:
+        home_score, away_score = scores[:2].astype(int)
+        if home_score > away_score:
+            result = f"<h3>Prediction: {home_score}-{away_score}: UNC Wins!</h3>"
+        else:
+            result = f"<h3>Prediction: {home_score}-{away_score}: UNC Loses</h3>"
+    else:
+        result = "<h3>Error: Not enough score data.</h3>"
+
+    return jsonify({'result': result})
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
